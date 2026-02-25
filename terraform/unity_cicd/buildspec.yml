@@ -1,0 +1,67 @@
+version: 0.2
+run-as: ubuntu
+
+env:
+  variables:
+    HOME: "/home/ubuntu"
+    UNITY_BUILD_METHOD: "CIBuilder.BuildProject"
+    OUTPUT_APK_PATH: "Builds/app.apk"
+
+phases:
+  pre_build:
+    commands:
+      - echo "Unity build starting"
+      - git lfs pull
+      - test -n "$GITHUB_REPO"
+      - test -n "$UNITY_PATH"
+      - test -x "$UNITY_PATH"
+      - test -n "$witToken"
+      - test -n "$witServerToken"
+      - if [ -z "${photonAppId:-}" ]; then echo "photonAppId is empty. Photon injection is skipped."; fi
+      - test -n "$RELEASE_TAG"
+
+  build:
+    commands:
+      - mkdir -p "$(dirname \"$OUTPUT_APK_PATH\")"
+      - |
+        if [ -n "${photonAppId:-}" ]; then
+          "$UNITY_PATH" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -projectPath "$CODEBUILD_SRC_DIR" \
+            -buildTarget Android \
+            -executeMethod "$UNITY_BUILD_METHOD" \
+            -witToken "$witToken" \
+            -witServerToken "$witServerToken" \
+            -photonAppId "$photonAppId" \
+            -logFile "$CODEBUILD_SRC_DIR/unity-build.log"
+        else
+          "$UNITY_PATH" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -projectPath "$CODEBUILD_SRC_DIR" \
+            -buildTarget Android \
+            -executeMethod "$UNITY_BUILD_METHOD" \
+            -witToken "$witToken" \
+            -witServerToken "$witServerToken" \
+            -logFile "$CODEBUILD_SRC_DIR/unity-build.log"
+        fi
+      - test -f "$CODEBUILD_SRC_DIR/$OUTPUT_APK_PATH"
+
+  post_build:
+    commands:
+      - cat "$CODEBUILD_SRC_DIR/unity-build.log" || true
+      - |
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+          echo "$GITHUB_TOKEN" | gh auth login --with-token
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPO" --title "$RELEASE_TAG" --notes "Automated Unity Android build"
+          gh release upload "$RELEASE_TAG" "$CODEBUILD_SRC_DIR/$OUTPUT_APK_PATH" --repo "$GITHUB_REPO" --clobber
+        fi
+
+artifacts:
+  files:
+    - Builds/app.apk
+  discard-paths: no

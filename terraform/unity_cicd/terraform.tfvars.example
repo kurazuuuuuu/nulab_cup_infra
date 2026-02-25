@@ -1,0 +1,24 @@
+unity_ami_id = "ami-xxxxxxxxxxxxxxxx"
+github_repo  = "your_github_repo"
+unity_path   = "/home/ubuntu/Unity/Hub/Editor/6000.3.9f1/Editor/Unity"
+photon_app_id = ""
+
+# Optional: set only when using a region outside the built-in mapping.
+# codebuild_organization_arn = "arn:aws:organizations::<account-id>:organization/<org-id>"
+
+# Secret value is intentionally not managed by Terraform (to avoid writing it into state).
+# Set the secret value after apply using the output secret name:
+# SECRET_NAME=$(terraform -chdir=terraform/unity_cicd output -raw github_token_secret_name)
+# aws secretsmanager put-secret-value \
+#   --secret-id "$SECRET_NAME" \
+#   --secret-string '{"token":"github_pat_xxxxxxxx"}'
+#
+# WIT_SECRET_NAME=$(terraform -chdir=terraform/unity_cicd output -raw wit_client_token_secret_name)
+# aws secretsmanager put-secret-value \
+#   --secret-id "$WIT_SECRET_NAME" \
+#   --secret-string '{"token":"wit_client_token_xxxxxxxx"}'
+#
+# WIT_SERVER_SECRET_NAME=$(terraform -chdir=terraform/unity_cicd output -raw wit_server_token_secret_name)
+# aws secretsmanager put-secret-value \
+#   --secret-id "$WIT_SERVER_SECRET_NAME" \
+#   --secret-string '{"token":"wit_server_token_xxxxxxxx"}'
