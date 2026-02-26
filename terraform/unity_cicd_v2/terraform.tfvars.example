@@ -1,10 +1,24 @@
 unity_ami_id = "ami-xxxxxxxxxxxxxxxx"
 github_repo  = "your_github_repo"
+# codeconnections_connection_arn = "arn:aws:codestar-connections:ap-northeast-1:123456789012:connection/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 unity_path   = "/home/ubuntu/Unity/Hub/Editor/6000.3.9f1/Editor/Unity"
 photon_app_id = ""
-enable_webhook = true
-tag_regex       = "^refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+$"
 cache_namespace = "unity-6000.3.9f1"
+
+# Fleet compute tuning:
+# codebuild_fleet_compute_type = "CUSTOM_INSTANCE_TYPE"
+# codebuild_fleet_instance_type = "c7i.4xlarge"
+#
+# ATTRIBUTE_BASED_COMPUTE example:
+# codebuild_fleet_compute_type = "ATTRIBUTE_BASED_COMPUTE"
+# codebuild_fleet_machine_type = "GENERAL"
+# codebuild_fleet_vcpu = 16
+# codebuild_fleet_memory = 32
+
+# Optional custom S3 cache archive settings:
+# unity_s3_cache_bucket = "my-unity-build-cache"
+# unity_s3_cache_prefix = ""
+# unity_s3_cache_fallback_branch = "main"
 
 # Optional: set only when using a region outside the built-in mapping.
 # codebuild_organization_arn = "arn:aws:organizations::<account-id>:organization/<org-id>"

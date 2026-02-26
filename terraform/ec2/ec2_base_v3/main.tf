@@ -4,7 +4,7 @@ data "aws_ssm_parameter" "ubuntu_2204_ami_id" {
 
 resource "aws_instance" "unity_ami_builder" {
   ami                    = data.aws_ssm_parameter.ubuntu_2204_ami_id.value
-  instance_type          = "t3.large"
+  instance_type          = "c5a.xlarge"
   subnet_id              = aws_subnet.unity_ami_builder.id
   vpc_security_group_ids = [aws_security_group.unity_ami_builder.id]
   iam_instance_profile   = aws_iam_instance_profile.unity_ami_builder.name
@@ -18,7 +18,7 @@ resource "aws_instance" "unity_ami_builder" {
   }
 
   root_block_device {
-    volume_size           = 50
+    volume_size           = 30
     volume_type           = "gp3"
     delete_on_termination = true
   }
@@ -51,6 +51,13 @@ resource "aws_instance" "unity_ami_builder" {
     XEOF
     chmod +x /home/ubuntu/.vnc/xstartup
     chown ubuntu:ubuntu /home/ubuntu/.vnc/xstartup
+
+    sudo install -d /etc/apt/keyrings
+    curl -fsSL https://hub.unity3d.com/linux/keys/public | sudo gpg --dearmor -o /etc/apt/keyrings/unityhub.gpg
+
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/unityhub.gpg] https://hub.unity3d.com/linux/repos/deb stable main" | sudo tee /etc/apt/sources.list.d/unityhub.list
+
+    apt-get update && apt-get install unityhub -y
   EOT
 
   tags = {

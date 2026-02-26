@@ -11,9 +11,12 @@ env:
 phases:
   install:
     commands:
+      - command -v aws >/dev/null 2>&1 || { echo "aws cli is required in the AMI"; exit 1; }
       - command -v git >/dev/null 2>&1 || { echo "git is required in the AMI"; exit 1; }
       - command -v git-lfs >/dev/null 2>&1 || { echo "git-lfs is required in the AMI"; exit 1; }
       - command -v gh >/dev/null 2>&1 || { echo "gh is required in the AMI"; exit 1; }
+      - command -v tar >/dev/null 2>&1 || { echo "tar is required in the AMI"; exit 1; }
+      - command -v zstd >/dev/null 2>&1 || { echo "zstd is required in the AMI"; exit 1; }
 
   pre_build:
     commands:
@@ -22,58 +25,89 @@ phases:
       - test -n "$GITHUB_REPO"
       - test -n "$UNITY_PATH"
       - test -x "$UNITY_PATH"
-      - test -n "$witToken"
-      - test -n "$witServerToken"
-      - if [ -z "${photonAppId:-}" ]; then echo "photonAppId is empty. Photon injection is skipped."; fi
       - |
-        if [ -n "${CODEBUILD_WEBHOOK_HEAD_REF:-}" ]; then
+        if [[ "${CODEBUILD_WEBHOOK_HEAD_REF:-}" == refs/tags/* ]]; then
           RELEASE_TAG="${CODEBUILD_WEBHOOK_HEAD_REF#refs/tags/}"
+          SHOULD_UPLOAD_GH_RELEASE="1"
         elif [ -n "${RELEASE_TAG:-}" ]; then
-          RELEASE_TAG="${RELEASE_TAG}"
+          SHOULD_UPLOAD_GH_RELEASE="1"
         else
-          echo "RELEASE_TAG is required for manual builds."
-          exit 1
+          SHORT_SHA="$(printf '%s' "${CODEBUILD_RESOLVED_SOURCE_VERSION:-unknown}" | cut -c1-8)"
+          RELEASE_TAG="snapshot-${SHORT_SHA}"
+          SHOULD_UPLOAD_GH_RELEASE="0"
         fi
-        case "$RELEASE_TAG" in
-          v[0-9]*.[0-9]*.[0-9]*) ;;
-          *)
-            echo "Invalid RELEASE_TAG: $RELEASE_TAG"
-            exit 1
-            ;;
-        esac
+        SAFE_RELEASE_TAG="$(printf '%s' "$RELEASE_TAG" | tr '/:' '--')"
         export RELEASE_TAG
-        export OUTPUT_APK_PATH="Builds/${OUTPUT_APK_BASENAME}-${RELEASE_TAG}.apk"
+        export SHOULD_UPLOAD_GH_RELEASE
+        export OUTPUT_APK_PATH="Builds/${OUTPUT_APK_BASENAME}-${SAFE_RELEASE_TAG}.apk"
         echo "Resolved RELEASE_TAG=$RELEASE_TAG"
       - echo "Using cache namespace: ${CACHE_NAMESPACE:-default}"
+      - bash "$CODEBUILD_SRC_DIR/scripts/unity-s3-cache.sh" restore
 
   build:
     commands:
       - mkdir -p "$(dirname \"$OUTPUT_APK_PATH\")"
       - |
-        if [ -n "${photonAppId:-}" ]; then
-          "$UNITY_PATH" \
-            -batchmode \
-            -nographics \
-            -quit \
-            -projectPath "$CODEBUILD_SRC_DIR" \
-            -buildTarget Android \
-            -executeMethod "$UNITY_BUILD_METHOD" \
-            -witToken "$witToken" \
-            -witServerToken "$witServerToken" \
-            -photonAppId "$photonAppId" \
-            -logFile "$CODEBUILD_SRC_DIR/unity-build.log"
-        else
-          "$UNITY_PATH" \
-            -batchmode \
-            -nographics \
-            -quit \
-            -projectPath "$CODEBUILD_SRC_DIR" \
-            -buildTarget Android \
-            -executeMethod "$UNITY_BUILD_METHOD" \
-            -witToken "$witToken" \
-            -witServerToken "$witServerToken" \
-            -logFile "$CODEBUILD_SRC_DIR/unity-build.log"
-        fi
+          run_unity_build() {
+            "$UNITY_PATH" \
+              -batchmode \
+              -nographics \
+              -quit \
+              -projectPath "$CODEBUILD_SRC_DIR" \
+              -buildTarget Android \
+              -executeMethod "$UNITY_BUILD_METHOD" \
+              -logFile "$CODEBUILD_SRC_DIR/unity-build.log"
+          }
+
+          apply_meta_xr_simulator_hotfix() {
+            local package_cache_dir="$CODEBUILD_SRC_DIR/Library/PackageCache"
+            local found=0
+            local patched=0
+            local installer_file=""
+
+            if [ ! -d "$package_cache_dir" ]; then
+              echo "Meta XR hotfix skipped: PackageCache does not exist yet."
+              return 1
+            fi
+
+            while IFS= read -r installer_file; do
+              found=1
+              if grep -q "downloadedInstallerPath" "$installer_file"; then
+                sed -i 's/\<downloadedInstallerPath\>/string.Empty/g' "$installer_file"
+                echo "Applied Meta XR simulator hotfix: $installer_file"
+                patched=1
+              fi
+            done < <(find "$package_cache_dir" -type f -path "*/com.meta.xr.sdk.core@*/Editor/MetaXRSimulator/Installer.cs")
+
+            if [ "$found" -eq 0 ]; then
+              echo "Meta XR hotfix skipped: Installer.cs not found."
+              return 1
+            fi
+
+            if [ "$patched" -eq 0 ]; then
+              echo "Meta XR hotfix skipped: target token not found."
+              return 1
+            fi
+
+            return 0
+          }
+
+          set +e
+          run_unity_build
+          unity_exit_code=$?
+          set -e
+
+          if [ "$unity_exit_code" -ne 0 ] && grep -q "downloadedInstallerPath' does not exist in the current context" "$CODEBUILD_SRC_DIR/unity-build.log"; then
+            echo "Detected known Meta XR simulator compile issue. Trying one-time hotfix and retry."
+            if apply_meta_xr_simulator_hotfix; then
+              run_unity_build
+            else
+              echo "Failed to apply Meta XR simulator hotfix."
+              exit "$unity_exit_code"
+            fi
+          elif [ "$unity_exit_code" -ne 0 ]; then
+            exit "$unity_exit_code"
+          fi
       - |
         if [ -f "$CODEBUILD_SRC_DIR/$OUTPUT_APK_PATH" ]; then
           echo "APK exists at requested path: $OUTPUT_APK_PATH"
@@ -81,8 +115,24 @@ phases:
           mv "$CODEBUILD_SRC_DIR/$SOURCE_APK_PATH" "$CODEBUILD_SRC_DIR/$OUTPUT_APK_PATH"
           echo "Renamed APK from $SOURCE_APK_PATH to $OUTPUT_APK_PATH"
         else
-          echo "APK not found at either $OUTPUT_APK_PATH or $SOURCE_APK_PATH"
-          exit 1
+          echo "APK not found at expected paths. Searching fallback locations..."
+          CANDIDATE_APK=""
+          if [ -d "$CODEBUILD_SRC_DIR/Builds" ]; then
+            CANDIDATE_APK="$(find "$CODEBUILD_SRC_DIR/Builds" -type f -name "*.apk" | sort | head -n 1)"
+          fi
+          if [ -z "$CANDIDATE_APK" ]; then
+            CANDIDATE_APK="$(find "$CODEBUILD_SRC_DIR" -type f -name "*.apk" -not -path "*/Library/*" -not -path "*/.git/*" | sort | head -n 1)"
+          fi
+
+          if [ -n "$CANDIDATE_APK" ] && [ -f "$CANDIDATE_APK" ]; then
+            mv "$CANDIDATE_APK" "$CODEBUILD_SRC_DIR/$OUTPUT_APK_PATH"
+            echo "Moved fallback APK from ${CANDIDATE_APK#$CODEBUILD_SRC_DIR/} to $OUTPUT_APK_PATH"
+          else
+            echo "APK not found after fallback search."
+            echo "Workspace APK scan (for debug):"
+            find "$CODEBUILD_SRC_DIR" -type f -name "*.apk" -not -path "*/Library/*" -not -path "*/.git/*" | sort || true
+            exit 1
+          fi
         fi
 
   post_build:
@@ -90,10 +140,20 @@ phases:
       - cat "$CODEBUILD_SRC_DIR/unity-build.log" || true
       - |
         if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
-          echo "$GITHUB_TOKEN" | gh auth login --with-token
-          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1 || \
-            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPO" --title "$RELEASE_TAG" --notes "Automated Unity Android build"
-          gh release upload "$RELEASE_TAG" "$CODEBUILD_SRC_DIR/$OUTPUT_APK_PATH" --repo "$GITHUB_REPO" --clobber
+          bash "$CODEBUILD_SRC_DIR/scripts/unity-s3-cache.sh" save
+        else
+          echo "Skipping custom cache save because the build failed."
+        fi
+      - |
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+          if [ "${SHOULD_UPLOAD_GH_RELEASE:-0}" = "1" ]; then
+            echo "$GITHUB_TOKEN" | gh auth login --with-token
+            gh release view "$RELEASE_TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1 || \
+              gh release create "$RELEASE_TAG" --repo "$GITHUB_REPO" --title "$RELEASE_TAG" --notes "Automated Unity Android build"
+            gh release upload "$RELEASE_TAG" "$CODEBUILD_SRC_DIR/$OUTPUT_APK_PATH" --repo "$GITHUB_REPO" --clobber
+          else
+            echo "Skipping GitHub release upload for non-tag build."
+          fi
         fi
 
 artifacts:

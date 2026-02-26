@@ -18,9 +18,9 @@ output "codebuild_cache_location" {
   value       = "${aws_s3_bucket.codebuild_artifacts.bucket}/${var.codebuild_cache_prefix}/${var.codebuild_project_name}/${var.cache_namespace}"
 }
 
-output "codebuild_webhook_url" {
-  description = "CodeBuild webhook URL for GitHub integration (null when disabled)"
-  value       = var.enable_webhook ? aws_codebuild_webhook.unity_android[0].url : null
+output "unity_s3_cache_root" {
+  description = "S3 root for custom Unity commit/branch cache archives"
+  value       = "s3://${local.unity_s3_cache_bucket}${local.unity_s3_cache_prefix == "" ? "" : "/${local.unity_s3_cache_prefix}"}"
 }
 
 output "github_token_secret_arn" {
@@ -33,22 +33,13 @@ output "github_token_secret_name" {
   value       = aws_secretsmanager_secret.github_token.name
 }
 
-output "wit_client_token_secret_arn" {
-  description = "Secrets Manager ARN for Wit client token"
-  value       = aws_secretsmanager_secret.wit_client_token.arn
+output "codebuild_webhook_payload_url" {
+  description = "GitHub webhook payload URL to register in the repository settings (CodeBuild GitHub Actions Runner)"
+  value       = var.enable_runner_webhook ? aws_codebuild_webhook.unity[0].payload_url : null
 }
 
-output "wit_client_token_secret_name" {
-  description = "Secrets Manager name for Wit client token"
-  value       = aws_secretsmanager_secret.wit_client_token.name
-}
-
-output "wit_server_token_secret_arn" {
-  description = "Secrets Manager ARN for Wit server token"
-  value       = aws_secretsmanager_secret.wit_server_token.arn
-}
-
-output "wit_server_token_secret_name" {
-  description = "Secrets Manager name for Wit server token"
-  value       = aws_secretsmanager_secret.wit_server_token.name
+output "codebuild_webhook_secret" {
+  description = "GitHub webhook secret for the CodeBuild GitHub Actions Runner webhook"
+  value       = var.enable_runner_webhook ? aws_codebuild_webhook.unity[0].secret : null
+  sensitive   = true
 }

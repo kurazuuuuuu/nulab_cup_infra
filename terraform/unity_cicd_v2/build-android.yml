@@ -1,0 +1,233 @@
+name: Unity Android Build
+
+on: [push]
+
+permissions:
+  contents: write
+
+env:
+  HOME: /home/ubuntu
+  UNITY_SCENES: "Assets/Scenes/nulab_cup_new.unity"
+  SOURCE_APK_PATH: "Builds/app.apk"
+  SOURCE_AAB_PATH: "Builds/app.aab"
+  OUTPUT_APK_BASENAME: "app"
+  UNITY_PATH: "/home/ubuntu/Unity/Hub/Editor/6000.3.9f1/Editor/Unity"
+  UNITY_S3_CACHE_BUCKET: ${{ vars.UNITY_S3_CACHE_BUCKET || secrets.UNITY_S3_CACHE_BUCKET }}
+  UNITY_S3_CACHE_PREFIX: ${{ vars.UNITY_S3_CACHE_PREFIX || secrets.UNITY_S3_CACHE_PREFIX }}
+  UNITY_S3_CACHE_FALLBACK_BRANCH: ${{ vars.UNITY_S3_CACHE_FALLBACK_BRANCH || 'main' }}
+  CACHE_NAMESPACE: ${{ vars.CACHE_NAMESPACE || 'unity-6000.3.9f1' }}
+  UPLOAD_SNAPSHOT_RELEASE: ${{ vars.UPLOAD_SNAPSHOT_RELEASE || '1' }}
+
+jobs:
+  build:
+    runs-on:
+      - codebuild-unity-android-build-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Fix home directory permissions
+        run: |
+          chmod a+rx /home/ubuntu
+          chmod -R a+rwX /home/ubuntu/.local 2>/dev/null || true
+          chmod -R a+rwX /home/ubuntu/.config 2>/dev/null || true
+          chmod -R a+rwX /home/ubuntu/.gradle 2>/dev/null || true
+
+      - name: Check required tools
+        run: |
+          command -v aws >/dev/null 2>&1 || { echo "aws cli required"; exit 1; }
+          command -v git >/dev/null 2>&1 || { echo "git required"; exit 1; }
+          command -v git-lfs >/dev/null 2>&1 || { echo "git-lfs required"; exit 1; }
+          command -v gh >/dev/null 2>&1 || { echo "gh required"; exit 1; }
+          command -v tar >/dev/null 2>&1 || { echo "tar required"; exit 1; }
+          command -v zstd >/dev/null 2>&1 || { echo "zstd required"; exit 1; }
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Git LFS Pull
+        run: git lfs pull
+
+      - name: Set build variables
+        run: |
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
+            SHOULD_UPLOAD_GH_RELEASE="1"
+          else
+            SHORT_SHA="$(printf '%s' "${GITHUB_SHA:-unknown}" | cut -c1-8)"
+            RELEASE_TAG="snapshot-${SHORT_SHA}"
+            SHOULD_UPLOAD_GH_RELEASE="${UPLOAD_SNAPSHOT_RELEASE:-1}"
+          fi
+          SAFE_RELEASE_TAG="$(printf '%s' "$RELEASE_TAG" | tr '/:' '--')"
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "SAFE_RELEASE_TAG=$SAFE_RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "SHOULD_UPLOAD_GH_RELEASE=$SHOULD_UPLOAD_GH_RELEASE" >> "$GITHUB_ENV"
+          echo "OUTPUT_APK_PATH=Builds/${OUTPUT_APK_BASENAME}-${SAFE_RELEASE_TAG}.apk" >> "$GITHUB_ENV"
+          echo "OUTPUT_ARTIFACT_PATH=Builds/${OUTPUT_APK_BASENAME}-${SAFE_RELEASE_TAG}.apk" >> "$GITHUB_ENV"
+
+      - name: Restore Unity Cache
+        run: bash "$GITHUB_WORKSPACE/scripts/unity-s3-cache.sh" restore
+
+      - name: Inject CI build entrypoint
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/Assets/Editor"
+          cat > "$GITHUB_WORKSPACE/Assets/Editor/CIEntryPoint.cs" <<'EOF'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+
+          public static class CIEntryPoint
+          {
+              public static void BuildAndroid()
+              {
+                  var outputPath = Environment.GetEnvironmentVariable("OUTPUT_ARTIFACT_PATH");
+                  if (string.IsNullOrWhiteSpace(outputPath))
+                  {
+                      outputPath = Environment.GetEnvironmentVariable("OUTPUT_APK_PATH");
+                  }
+                  if (string.IsNullOrWhiteSpace(outputPath))
+                  {
+                      outputPath = "Builds/app.apk";
+                  }
+
+                  var scenesEnv = Environment.GetEnvironmentVariable("UNITY_SCENES");
+                  string[] scenes;
+                  if (!string.IsNullOrWhiteSpace(scenesEnv))
+                  {
+                      scenes = scenesEnv
+                          .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                          .Select(scene => scene.Trim())
+                          .ToArray();
+                  }
+                  else
+                  {
+                      scenes = EditorBuildSettings.scenes
+                          .Where(scene => scene.enabled)
+                          .Select(scene => scene.path)
+                          .ToArray();
+                  }
+
+                  if (scenes.Length == 0)
+                  {
+                      throw new Exception("No scenes configured for build.");
+                  }
+
+                  var outputDir = Path.GetDirectoryName(outputPath);
+                  if (!string.IsNullOrEmpty(outputDir))
+                  {
+                      Directory.CreateDirectory(outputDir);
+                  }
+
+                  EditorUserBuildSettings.buildAppBundle =
+                      Path.GetExtension(outputPath).Equals(".aab", StringComparison.OrdinalIgnoreCase);
+
+                  var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
+                  {
+                      scenes = scenes,
+                      locationPathName = outputPath,
+                      target = BuildTarget.Android,
+                      options = BuildOptions.None,
+                  });
+
+                  if (report.summary.result != BuildResult.Succeeded)
+                  {
+                      throw new Exception("Unity Android build failed: " + report.summary.result);
+                  }
+
+                  Console.WriteLine("Unity Android build succeeded: " + outputPath);
+              }
+          }
+          EOF
+
+      - name: Unity Build (first)
+        id: unity_build_first
+        continue-on-error: true
+        run: |
+          mkdir -p "$(dirname "$OUTPUT_APK_PATH")"
+          "$UNITY_PATH" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -projectPath "$GITHUB_WORKSPACE" \
+            -buildTarget Android \
+            -executeMethod "CIEntryPoint.BuildAndroid" \
+            -logFile "$GITHUB_WORKSPACE/unity-build.log"
+
+      - name: Patch MetaXR Simulator (only known error)
+        if: steps.unity_build_first.outcome == 'failure'
+        run: |
+          if grep -q "downloadedInstallerPath' does not exist in the current context" "$GITHUB_WORKSPACE/unity-build.log"; then
+            bash "$GITHUB_WORKSPACE/scripts/patch-meta-xr-simulator.sh" "$GITHUB_WORKSPACE"
+          else
+            echo "First build failed for a different reason."
+            exit 1
+          fi
+
+      - name: Unity Build (retry after patch)
+        if: steps.unity_build_first.outcome == 'failure'
+        run: |
+          "$UNITY_PATH" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -projectPath "$GITHUB_WORKSPACE" \
+            -buildTarget Android \
+            -executeMethod "CIEntryPoint.BuildAndroid" \
+            -logFile "$GITHUB_WORKSPACE/unity-build.log"
+
+      - name: Check and rename APK
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/$OUTPUT_ARTIFACT_PATH" ]; then
+            echo "Artifact found: $OUTPUT_ARTIFACT_PATH"
+          elif [ -f "$GITHUB_WORKSPACE/$SOURCE_APK_PATH" ]; then
+            mv "$GITHUB_WORKSPACE/$SOURCE_APK_PATH" "$GITHUB_WORKSPACE/$OUTPUT_ARTIFACT_PATH"
+            echo "Renamed APK from $SOURCE_APK_PATH to $OUTPUT_ARTIFACT_PATH"
+          elif [ -f "$GITHUB_WORKSPACE/$SOURCE_AAB_PATH" ]; then
+            OUTPUT_ARTIFACT_PATH="Builds/${OUTPUT_APK_BASENAME}-${SAFE_RELEASE_TAG}.aab"
+            mv "$GITHUB_WORKSPACE/$SOURCE_AAB_PATH" "$GITHUB_WORKSPACE/$OUTPUT_ARTIFACT_PATH"
+            echo "Renamed AAB from $SOURCE_AAB_PATH to $OUTPUT_ARTIFACT_PATH"
+            echo "OUTPUT_ARTIFACT_PATH=$OUTPUT_ARTIFACT_PATH" >> "$GITHUB_ENV"
+          else
+            echo "Artifact not found at expected paths. Searching fallback locations..."
+            CANDIDATE_ARTIFACT=""
+            if [ -d "$GITHUB_WORKSPACE/Builds" ]; then
+              CANDIDATE_ARTIFACT="$(find "$GITHUB_WORKSPACE/Builds" -type f \( -name "*.apk" -o -name "*.aab" \) | sort | head -n 1)"
+            fi
+            if [ -z "$CANDIDATE_ARTIFACT" ]; then
+              CANDIDATE_ARTIFACT="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.apk" -o -name "*.aab" \) -not -path "*/Library/*" -not -path "*/.git/*" | sort | head -n 1)"
+            fi
+
+            if [ -n "$CANDIDATE_ARTIFACT" ] && [ -f "$CANDIDATE_ARTIFACT" ]; then
+              CANDIDATE_EXT="${CANDIDATE_ARTIFACT##*.}"
+              OUTPUT_ARTIFACT_PATH="Builds/${OUTPUT_APK_BASENAME}-${SAFE_RELEASE_TAG}.${CANDIDATE_EXT}"
+              mv "$CANDIDATE_ARTIFACT" "$GITHUB_WORKSPACE/$OUTPUT_ARTIFACT_PATH"
+              echo "Moved fallback artifact from ${CANDIDATE_ARTIFACT#$GITHUB_WORKSPACE/} to $OUTPUT_ARTIFACT_PATH"
+              echo "OUTPUT_ARTIFACT_PATH=$OUTPUT_ARTIFACT_PATH" >> "$GITHUB_ENV"
+            else
+              echo "Artifact not found after fallback search."
+              echo "Workspace artifact scan (for debug):"
+              find "$GITHUB_WORKSPACE" -type f \( -name "*.apk" -o -name "*.aab" \) -not -path "*/Library/*" -not -path "*/.git/*" | sort || true
+              echo "Unity log hints:"
+              grep -E "Build completed|Build result|Output|AAB|APK|BuildPipeline" "$GITHUB_WORKSPACE/unity-build.log" | tail -n 50 || true
+              exit 1
+            fi
+          fi
+
+      - name: Print build log
+        if: always()
+        run: cat "$GITHUB_WORKSPACE/unity-build.log" || true
+
+      - name: Save Unity Cache
+        if: success()
+        run: bash "$GITHUB_WORKSPACE/scripts/unity-s3-cache.sh" save
+
+      - name: Upload GitHub Release
+        if: success() && env.SHOULD_UPLOAD_GH_RELEASE == '1'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --repo "${{ github.repository }}" --title "$RELEASE_TAG" --notes "Automated Unity Android build"
+          gh release upload "$RELEASE_TAG" "$GITHUB_WORKSPACE/$OUTPUT_ARTIFACT_PATH" --repo "${{ github.repository }}" --clobber

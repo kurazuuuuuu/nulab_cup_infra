@@ -35,8 +35,16 @@ locals {
     ),
     ".git"
   )
-  github_repo_clone_url    = "https://github.com/${local.github_repo_normalized}.git"
-  codebuild_cache_location = "${aws_s3_bucket.codebuild_artifacts.bucket}/${var.codebuild_cache_prefix}/${var.codebuild_project_name}/${var.cache_namespace}"
+  github_repo_clone_url     = "https://github.com/${local.github_repo_normalized}.git"
+  codebuild_cache_location  = "${aws_s3_bucket.codebuild_artifacts.bucket}/${var.codebuild_cache_prefix}/${var.codebuild_project_name}/${var.cache_namespace}"
+  unity_s3_cache_bucket     = coalesce(var.unity_s3_cache_bucket, aws_s3_bucket.codebuild_artifacts.bucket)
+  unity_s3_cache_prefix     = trim(var.unity_s3_cache_prefix, "/")
+  unity_s3_cache_bucket_arn = "arn:aws:s3:::${local.unity_s3_cache_bucket}"
+  codeconnections_arns = var.codeconnections_connection_arn == null ? [] : distinct([
+    var.codeconnections_connection_arn,
+    replace(var.codeconnections_connection_arn, ":codestar-connections:", ":codeconnections:"),
+    replace(var.codeconnections_connection_arn, ":codeconnections:", ":codestar-connections:"),
+  ])
 }
 
 resource "aws_ami_launch_permission" "codebuild_org" {
@@ -54,12 +62,26 @@ resource "aws_ami_launch_permission" "codebuild_org" {
 resource "aws_codebuild_fleet" "unity" {
   name               = var.codebuild_fleet_name
   base_capacity      = 1
-  compute_type       = "BUILD_GENERAL1_LARGE"
+  compute_type       = var.codebuild_fleet_compute_type
   environment_type   = "LINUX_EC2"
   fleet_service_role = aws_iam_role.codebuild_fleet_service.arn
   image_id           = var.unity_ami_id
   overflow_behavior  = "QUEUE"
-  depends_on         = [aws_ami_launch_permission.codebuild_org]
+  depends_on = [
+    aws_ami_launch_permission.codebuild_org,
+    aws_iam_role_policy.codebuild_fleet_permissions,
+  ]
+
+  dynamic "compute_configuration" {
+    for_each = contains(["CUSTOM_INSTANCE_TYPE", "ATTRIBUTE_BASED_COMPUTE"], var.codebuild_fleet_compute_type) ? [1] : []
+
+    content {
+      instance_type = var.codebuild_fleet_instance_type
+      machine_type  = var.codebuild_fleet_machine_type
+      vcpu          = var.codebuild_fleet_vcpu
+      memory        = var.codebuild_fleet_memory
+    }
+  }
 
   scaling_configuration {
     max_capacity = 2
@@ -73,6 +95,22 @@ resource "aws_codebuild_fleet" "unity" {
 
   tags = {
     Name = var.codebuild_fleet_name
+  }
+
+  lifecycle {
+    precondition {
+      condition     = !contains(["BUILD_GENERAL1_XLARGE", "BUILD_GENERAL1_2XLARGE"], var.codebuild_fleet_compute_type)
+      error_message = "LINUX_EC2 fleet does not support BUILD_GENERAL1_XLARGE/BUILD_GENERAL1_2XLARGE. Use CUSTOM_INSTANCE_TYPE with compute_configuration.instance_type instead."
+    }
+
+    precondition {
+      condition = var.codebuild_fleet_compute_type != "ATTRIBUTE_BASED_COMPUTE" || length(compact([
+        var.codebuild_fleet_machine_type,
+        var.codebuild_fleet_vcpu == null ? null : tostring(var.codebuild_fleet_vcpu),
+        var.codebuild_fleet_memory == null ? null : tostring(var.codebuild_fleet_memory),
+      ])) > 0
+      error_message = "When codebuild_fleet_compute_type is ATTRIBUTE_BASED_COMPUTE, set at least one of machine_type, vcpu, or memory."
+    }
   }
 }
 
@@ -95,7 +133,7 @@ resource "aws_codebuild_project" "unity_android" {
   }
 
   environment {
-    compute_type = "BUILD_GENERAL1_LARGE"
+    compute_type = var.codebuild_fleet_compute_type
     image        = "aws/codebuild/amazonlinux2-x86_64-standard:5.0"
     type         = "LINUX_EC2"
 
@@ -120,25 +158,23 @@ resource "aws_codebuild_project" "unity_android" {
     }
 
     environment_variable {
-      name  = "witToken"
-      type  = "SECRETS_MANAGER"
-      value = "${aws_secretsmanager_secret.wit_client_token.arn}:token"
-    }
-
-    environment_variable {
-      name  = "witServerToken"
-      type  = "SECRETS_MANAGER"
-      value = "${aws_secretsmanager_secret.wit_server_token.arn}:token"
-    }
-
-    environment_variable {
-      name  = "photonAppId"
-      value = var.photon_app_id
-    }
-
-    environment_variable {
       name  = "CACHE_NAMESPACE"
       value = var.cache_namespace
+    }
+
+    environment_variable {
+      name  = "UNITY_S3_CACHE_BUCKET"
+      value = local.unity_s3_cache_bucket
+    }
+
+    environment_variable {
+      name  = "UNITY_S3_CACHE_PREFIX"
+      value = local.unity_s3_cache_prefix
+    }
+
+    environment_variable {
+      name  = "UNITY_S3_CACHE_FALLBACK_BRANCH"
+      value = var.unity_s3_cache_fallback_branch
     }
   }
 
@@ -154,29 +190,44 @@ resource "aws_codebuild_project" "unity_android" {
     location        = local.github_repo_clone_url
     git_clone_depth = 1
     buildspec       = file("${path.module}/buildspec.yml")
+
+    dynamic "auth" {
+      for_each = var.codeconnections_connection_arn == null ? [] : [1]
+
+      content {
+        type     = "CODECONNECTIONS"
+        resource = var.codeconnections_connection_arn
+      }
+    }
   }
 
-  source_version = "main"
+  depends_on = [
+    aws_iam_role_policy.codebuild_service_permissions,
+  ]
 
   tags = {
     Name = var.codebuild_project_name
   }
 }
 
-resource "aws_codebuild_webhook" "unity_android" {
-  count        = var.enable_webhook ? 1 : 0
+resource "aws_codebuild_webhook" "unity" {
+  count        = var.enable_runner_webhook ? 1 : 0
   project_name = aws_codebuild_project.unity_android.name
   build_type   = "BUILD"
 
   filter_group {
     filter {
       type    = "EVENT"
-      pattern = "PUSH"
+      pattern = "WORKFLOW_JOB_QUEUED"
     }
 
-    filter {
-      type    = "HEAD_REF"
-      pattern = var.tag_regex
+    dynamic "filter" {
+      for_each = var.runner_workflow_name_regex != null ? [1] : []
+
+      content {
+        type    = "WORKFLOW_NAME"
+        pattern = var.runner_workflow_name_regex
+      }
     }
   }
 }

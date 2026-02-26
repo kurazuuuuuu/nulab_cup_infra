@@ -42,10 +42,12 @@ data "aws_iam_policy_document" "codebuild_service_permissions" {
       "s3:ListBucket",
       "s3:PutObject"
     ]
-    resources = [
+    resources = distinct([
       aws_s3_bucket.codebuild_artifacts.arn,
-      "${aws_s3_bucket.codebuild_artifacts.arn}/*"
-    ]
+      "${aws_s3_bucket.codebuild_artifacts.arn}/*",
+      local.unity_s3_cache_bucket_arn,
+      "${local.unity_s3_cache_bucket_arn}/*"
+    ])
   }
 
   statement {
@@ -57,11 +59,21 @@ data "aws_iam_policy_document" "codebuild_service_permissions" {
     resources = [
       aws_secretsmanager_secret.github_token.arn,
       "${aws_secretsmanager_secret.github_token.arn}*",
-      aws_secretsmanager_secret.wit_client_token.arn,
-      "${aws_secretsmanager_secret.wit_client_token.arn}*",
-      aws_secretsmanager_secret.wit_server_token.arn,
-      "${aws_secretsmanager_secret.wit_server_token.arn}*"
     ]
+  }
+
+  statement {
+    sid    = "CodeConnectionsUseConnection"
+    effect = "Allow"
+    actions = [
+      "codestar-connections:UseConnection",
+      "codestar-connections:GetConnection",
+      "codestar-connections:GetConnectionToken",
+      "codeconnections:UseConnection",
+      "codeconnections:GetConnection",
+      "codeconnections:GetConnectionToken",
+    ]
+    resources = length(local.codeconnections_arns) > 0 ? local.codeconnections_arns : ["*"]
   }
 }
 

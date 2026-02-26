@@ -25,5 +25,5 @@ variable "ubuntu_ami_ssm_parameter_name" {
 variable "spot_max_price" {
   description = "Maximum hourly bid price for the Spot instance"
   type        = string
-  default     = "0.08"
+  default     = "0.2"
 }
