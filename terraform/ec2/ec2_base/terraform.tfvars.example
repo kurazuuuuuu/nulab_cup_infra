@@ -1,0 +1,5 @@
+vpc_cidr_block           = "10.0.0.0/16"
+subnet_cidr_block        = "10.0.1.0/24"
+subnet_availability_zone = "ap-northeast-1a"
+ubuntu_ami_ssm_parameter_name = "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id"
+spot_max_price           = "0.08"
